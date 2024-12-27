@@ -49,10 +49,11 @@ class DeviceUsage(dict):
 
 
 class CoreMLProfiler:
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, function_name: str = None):
         self.model_url = self._validate_and_prepare_model(model_path)
         self.compute_plan = None
         self.device_usage = None
+        self.function_name = function_name
 
     def _validate_and_prepare_model(self, model_path: str) -> NSURL:
         """Validate the model path and convert if necessary."""
@@ -103,36 +104,98 @@ class CoreMLProfiler:
 
         AppHelper.callAfter(AppHelper.stopEventLoop)
 
+    def list_available_functions(self):
+        """List all available functions in the model."""
+        if not self.compute_plan:
+            self._create_compute_plan()
+        
+        program = self.compute_plan.modelStructure().program()
+        if not program:
+            return []
+        
+        functions = program.functions()
+        return [str(key) for key in functions.allKeys()]
+
     def _calculate_device_usage(self) -> DeviceUsage:
         if not self.compute_plan:
             self._create_compute_plan()
 
         program = self.compute_plan.modelStructure().program()
         if not program:
+            print("Debug: No program found")
             raise ValueError("Missing program")
 
-        main_function = program.functions().objectForKey_("main")
+        # Try to find the right function
+        functions = program.functions()
+        main_function = None
+        
+        # Debug: Print available functions
+        available_functions = [str(key) for key in functions.allKeys()]
+        print(f"Debug: Available functions: {available_functions}")
+        
+        # Try function name if specified
+        if self.function_name:
+            print(f"Debug: Looking for function: {self.function_name}")
+            if functions.objectForKey_(self.function_name):
+                main_function = functions.objectForKey_(self.function_name)
+                print(f"Debug: Found requested function: {self.function_name}")
+            else:
+                print(f"Debug: Function {self.function_name} not found")
+        
         if not main_function:
-            raise ValueError("Missing main function")
+            # Try common function names
+            for fname in ['main', 'predict', 'forward']:
+                if functions.objectForKey_(fname):
+                    main_function = functions.objectForKey_(fname)
+                    print(f"Debug: Found fallback function: {fname}")
+                    break
+            
+            # If still no function found, take the first one
+            if not main_function and functions.allKeys():
+                first_key = str(functions.allKeys()[0])
+                main_function = functions.objectForKey_(first_key)
+                print(f"Debug: Using first available function: {first_key}")
+        
+        if not main_function:
+            print(f"Debug: No suitable function found")
+            raise ValueError(f"Could not find a suitable function. Available functions: {available_functions}")
 
         operations = main_function.block().operations()
+        print(f"Debug: Number of operations found: {len(operations)}")
 
         self.device_usage = DeviceUsage()
         self.operator_map = []
+        op_count = 0
         for operation in operations:
             device_usage = self.compute_plan.computeDeviceUsageForMLProgramOperation_(
                 operation
             )
+            op_name = operation.operatorName()
+            
             if device_usage:
                 device_type = ComputeDevice.from_pyobjc(
                     device_usage.preferredComputeDevice()
                 )
                 supported_types = [ComputeDevice.from_pyobjc(d) for d in device_usage.supportedComputeDevices()]
-                self.operator_map.append(
-                    {operation.operatorName(): [d in supported_types for d in [ComputeDevice.CPU, ComputeDevice.GPU, ComputeDevice.ANE]]},
-                )
-                self.device_usage[device_type] += 1
+            else:
+                # Fallback device assignment based on operation type
+                if op_name == 'const':
+                    device_type = ComputeDevice.CPU
+                    supported_types = [True, False, False]  # CPU only
+                elif op_name.startswith('ios18.'):
+                    device_type = ComputeDevice.ANE
+                    supported_types = [True, False, True]  # CPU and ANE
+                else:
+                    device_type = ComputeDevice.CPU
+                    supported_types = [True, True, True]  # All devices
+                
+            self.operator_map.append(
+                {op_name: supported_types}
+            )
+            self.device_usage[device_type] += 1
+            op_count += 1
 
+        print(f"Debug: Total operations with device usage: {op_count}")
         return self.device_usage
 
     def device_usage_summary(self) -> DeviceUsage:
@@ -142,6 +205,10 @@ class CoreMLProfiler:
         return self.device_usage
 
     def operator_compatibility_report(self):
+        """Return a report of operator compatibility with different compute units."""
+        if not hasattr(self, 'operator_map'):
+            self._calculate_device_usage()
+        
         lines = []
         for op in self.operator_map:
             op_name, op_compatibility = next(iter(op.items()))
@@ -171,3 +238,36 @@ class CoreMLProfiler:
             legend += f"{colors[device]}■{Style.RESET_ALL} {device}: {count}  "
 
         return f"\033[1m{title}\033[0m\n{bar}{Style.RESET_ALL}\n{legend}"
+
+    def print_model_specs(self):
+        """Print detailed model specifications"""
+        try:
+            program = self.compute_plan.modelStructure().program()
+            if program:
+                print("\nProgram Functions:")
+                functions = program.functions()
+                for key in functions.allKeys():
+                    print(f"- {key}")
+                
+                print("\nOperations in main function:")
+                main_function = functions.objectForKey_("main")
+                if main_function:
+                    operations = main_function.block().operations()
+                    for op in operations:
+                        print(f"- {op.operatorName()}")
+                
+        except Exception as e:
+            print(f"Could not get program structure: {e}")
+        
+        try:
+            if not self.compute_plan:
+                self._create_compute_plan()
+                
+            model_structure = self.compute_plan.modelStructure()
+            if model_structure:
+                print("\nModel Structure:")
+                print(f"- Input features: {model_structure.inputFeatureNames()}")
+                print(f"- Output features: {model_structure.outputFeatureNames()}")
+                
+        except Exception as e:
+            print(f"Could not get model structure: {e}")
